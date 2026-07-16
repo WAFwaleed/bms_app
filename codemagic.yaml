@@ -1,0 +1,25 @@
+workflows:
+  android-build:
+    name: Build BMS APK
+    max_build_duration: 60
+    environment:
+      flutter: stable
+    scripts:
+      - name: Regenerate android project files
+        script: |
+          # Save our custom manifest
+          cp android/app/src/main/AndroidManifest.xml /tmp/manifest_custom.xml
+          rm -rf android
+          flutter create --platforms=android --project-name bms_app .
+          # Restore our manifest with BLE permissions
+          cp /tmp/manifest_custom.xml android/app/src/main/AndroidManifest.xml
+      - name: Set minSdk to 21
+        script: |
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 21/' android/app/build.gradle.kts 2>/dev/null || true
+          sed -i 's/minSdkVersion flutter.minSdkVersion/minSdkVersion 21/' android/app/build.gradle 2>/dev/null || true
+      - name: Get packages
+        script: flutter pub get
+      - name: Build APK
+        script: flutter build apk --release
+    artifacts:
+      - build/**/outputs/**/*.apk
