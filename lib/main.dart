@@ -54,6 +54,14 @@ class _HomePageState extends State<HomePage> {
   String _hex(List<int> d) =>
       d.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(' ');
 
+  // Show printable ASCII — PACE frames are readable text like ~25014642...
+  String _asciiOf(List<int> d) {
+    final printable = d.where((b) => b >= 0x20 && b <= 0x7E).length;
+    if (printable < d.length * 0.6) return '';
+    return String.fromCharCodes(
+        d.map((b) => (b >= 0x20 && b <= 0x7E) ? b : 0x2E));
+  }
+
   Future<void> _startScan() async {
     await [
       Permission.bluetoothScan,
@@ -126,7 +134,9 @@ class _HomePageState extends State<HomePage> {
         if (data.isEmpty) return;
         _frameCount++;
         _byteCount += data.length;
-        _add('📥 [${data.length} بايت] ${_hex(data)}');
+        final ascii = _asciiOf(data);
+        _add('📥 [${data.length} بايت] ${_hex(data)}'
+            '${ascii.isEmpty ? "" : "\n     نص: $ascii"}');
       });
 
       setState(() => _busy = false);
@@ -134,6 +144,42 @@ class _HomePageState extends State<HomePage> {
       _add('❌ خطأ: $e');
       setState(() => _busy = false);
     }
+  }
+
+  // ---------- PACE (paceic) protocol ----------
+  // Format: ~ VER ADR CID1 CID2 LENGTH INFO CHKSUM CR
+  // All fields are ASCII hex characters.
+
+  // LENGTH field = 12-bit length + 4-bit checksum of that length
+  String _paceLength(int infoLen) {
+    if (infoLen == 0) return '0000';
+    final n = infoLen & 0xFFF;
+    int sum = ((n >> 8) & 0xF) + ((n >> 4) & 0xF) + (n & 0xF);
+    sum = ((~(sum & 0xFF)) + 1) & 0xF;
+    final v = (sum << 12) | n;
+    return v.toRadixString(16).toUpperCase().padLeft(4, '0');
+  }
+
+  // Frame checksum: sum of all ASCII chars between ~ and checksum, mod 65536, invert +1
+  String _paceChecksum(String body) {
+    int sum = 0;
+    for (final c in body.codeUnits) {
+      sum += c;
+    }
+    sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
+    return sum.toRadixString(16).toUpperCase().padLeft(4, '0');
+  }
+
+  // Build a paceic frame. ver: '25' or '20'. addr: pack address. cid1: 0x46 (lithium)
+  Uint8List _paceCmd(String ver, int addr, int cid1, int cid2, {String info = ''}) {
+    final a = addr.toRadixString(16).toUpperCase().padLeft(2, '0');
+    final c1 = cid1.toRadixString(16).toUpperCase().padLeft(2, '0');
+    final c2 = cid2.toRadixString(16).toUpperCase().padLeft(2, '0');
+    final len = _paceLength(info.length);
+    final body = '$ver$a$c1$c2$len$info';
+    final chk = _paceChecksum(body);
+    final frame = '~$body$chk\r';
+    return Uint8List.fromList(frame.codeUnits);
   }
 
   // JK BMS command builder: 0xAA 0x55 0x90 0xEB, cmd, len, 4-byte value, pad to 19, checksum
@@ -203,13 +249,31 @@ class _HomePageState extends State<HomePage> {
       _byteCount = 0;
     });
     _add('=================================');
-    _add('فحص شامل — تجربة كل الأوامر');
+    _add('فحص PACE — البروتوكول الحقيقي');
 
-    for (int cmd in [0x96, 0x97, 0x98, 0x00, 0x01, 0x02, 0x03, 0x10, 0x20]) {
-      await _send(
-          _jkCmd(cmd), 'أمر 0x${cmd.toRadixString(16).toUpperCase()}');
-      await Future.delayed(const Duration(milliseconds: 1200));
+    // Protocol version 25, address 1, CID1=0x46 (lithium iron)
+    // CID2: 0x42 = analog/live data, 0x44 = alarm, 0x47 = software ver, 0x51 = pack info
+    for (final v in ['25', '20']) {
+      for (final e in [
+        [0x42, '01'], // analog info (live data) with pack number
+        [0x42, ''], // analog info, no info field
+        [0x44, '01'], // alarm info
+        [0x47, ''], // software version
+        [0x51, ''], // pack capacity
+      ]) {
+        final cid2 = e[0] as int;
+        final info = e[1] as String;
+        await _send(
+          _paceCmd(v, 1, 0x46, cid2, info: info),
+          'PACE v$v CID2=0x${cid2.toRadixString(16).toUpperCase()}${info.isEmpty ? "" : " info=$info"}',
+        );
+        await Future.delayed(const Duration(milliseconds: 1200));
+      }
     }
+
+    // Address 0 broadcast variant
+    await _send(_paceCmd('25', 0, 0x46, 0x42, info: '00'), 'PACE v25 addr=0');
+    await Future.delayed(const Duration(milliseconds: 1200));
 
     _add('=================================');
     _add('انتهى — الرسائل: $_frameCount | البايتات: $_byteCount');
@@ -279,7 +343,7 @@ class _HomePageState extends State<HomePage> {
                   ElevatedButton.icon(
                     onPressed: (_busy || !connected) ? null : _probe,
                     icon: const Icon(Icons.travel_explore),
-                    label: const Text('فحص شامل'),
+                    label: const Text('فحص PACE'),
                   ),
                   if (connected)
                     ElevatedButton.icon(
