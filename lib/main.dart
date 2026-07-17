@@ -160,24 +160,53 @@ class _HomePageState extends State<HomePage> {
     return v.toRadixString(16).toUpperCase().padLeft(4, '0');
   }
 
-  // Frame checksum: sum of all ASCII chars between ~ and checksum, mod 65536, invert +1
-  String _paceChecksum(String body) {
+  // Frame checksum — several documented/plausible variants.
+  // variant 0: sum ASCII, invert, +1 (documented paceic)
+  // variant 1: sum ASCII, invert only
+  // variant 2: sum ASCII, plain
+  // variant 3: sum of hex nibble values, invert, +1
+  // variant 4: include leading '~' in sum, invert, +1
+  String _paceChecksum(String body, int variant) {
     int sum = 0;
-    for (final c in body.codeUnits) {
-      sum += c;
+    switch (variant) {
+      case 3:
+        for (final c in body.codeUnits) {
+          final v = int.tryParse(String.fromCharCode(c), radix: 16) ?? 0;
+          sum += v;
+        }
+        sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
+        break;
+      case 4:
+        sum = 0x7E;
+        for (final c in body.codeUnits) {
+          sum += c;
+        }
+        sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
+        break;
+      default:
+        for (final c in body.codeUnits) {
+          sum += c;
+        }
+        if (variant == 0) {
+          sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
+        } else if (variant == 1) {
+          sum = (~sum) & 0xFFFF;
+        } else {
+          sum = sum & 0xFFFF;
+        }
     }
-    sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
     return sum.toRadixString(16).toUpperCase().padLeft(4, '0');
   }
 
   // Build a paceic frame. ver: '25' or '20'. addr: pack address. cid1: 0x46 (lithium)
-  Uint8List _paceCmd(String ver, int addr, int cid1, int cid2, {String info = ''}) {
+  Uint8List _paceCmd(String ver, int addr, int cid1, int cid2,
+      {String info = '', int variant = 0}) {
     final a = addr.toRadixString(16).toUpperCase().padLeft(2, '0');
     final c1 = cid1.toRadixString(16).toUpperCase().padLeft(2, '0');
     final c2 = cid2.toRadixString(16).toUpperCase().padLeft(2, '0');
     final len = _paceLength(info.length);
     final body = '$ver$a$c1$c2$len$info';
-    final chk = _paceChecksum(body);
+    final chk = _paceChecksum(body, variant);
     final frame = '~$body$chk\r';
     return Uint8List.fromList(frame.codeUnits);
   }
@@ -249,34 +278,93 @@ class _HomePageState extends State<HomePage> {
       _byteCount = 0;
     });
     _add('=================================');
-    _add('فحص PACE — البروتوكول الحقيقي');
+    _add('مسح شامل — كل صيغ PACE');
+    _add('راح يتوقف تلقائياً عند أول رد');
 
-    // Protocol version 25, address 1, CID1=0x46 (lithium iron)
-    // CID2: 0x42 = analog/live data, 0x44 = alarm, 0x47 = software ver, 0x51 = pack info
-    for (final v in ['25', '20']) {
-      for (final e in [
-        [0x42, '01'], // analog info (live data) with pack number
-        [0x42, ''], // analog info, no info field
-        [0x44, '01'], // alarm info
-        [0x47, ''], // software version
-        [0x51, ''], // pack capacity
-      ]) {
-        final cid2 = e[0] as int;
-        final info = e[1] as String;
-        await _send(
-          _paceCmd(v, 1, 0x46, cid2, info: info),
-          'PACE v$v CID2=0x${cid2.toRadixString(16).toUpperCase()}${info.isEmpty ? "" : " info=$info"}',
-        );
-        await Future.delayed(const Duration(milliseconds: 1200));
+    final names = [
+      'ascii-inv+1',
+      'ascii-inv',
+      'ascii-plain',
+      'nibble-inv+1',
+      'with-tilde',
+    ];
+
+    int tried = 0;
+    for (int variant = 0; variant < 5; variant++) {
+      for (final ver in ['25', '20']) {
+        for (final addr in [0, 1]) {
+          final before = _frameCount;
+          tried++;
+          await _send(
+            _paceCmd(ver, addr, 0x46, 0x42, info: '', variant: variant),
+            '[${names[variant]}] v$ver addr=$addr',
+          );
+          await Future.delayed(const Duration(milliseconds: 900));
+          if (_frameCount > before) {
+            _add('🎉🎉🎉 =========================');
+            _add('🎉 وصل رد! الصيغة الصحيحة:');
+            _add('🎉 checksum = ${names[variant]}');
+            _add('🎉 version = $ver | address = $addr');
+            _add('🎉 =========================');
+            setState(() => _busy = false);
+            return;
+          }
+        }
       }
     }
 
-    // Address 0 broadcast variant
-    await _send(_paceCmd('25', 0, 0x46, 0x42, info: '00'), 'PACE v25 addr=0');
-    await Future.delayed(const Duration(milliseconds: 1200));
+    _add('=================================');
+    _add('جُرّبت $tried صيغة — لا يوجد رد');
+    setState(() => _busy = false);
+  }
+
+  // Send the same request with an info field (pack number), all variants
+  Future<void> _probe2() async {
+    setState(() {
+      _busy = true;
+      _frameCount = 0;
+      _byteCount = 0;
+    });
+    _add('=================================');
+    _add('مسح ٢ — مع حقل معلومات');
+
+    final names = [
+      'ascii-inv+1',
+      'ascii-inv',
+      'ascii-plain',
+      'nibble-inv+1',
+      'with-tilde',
+    ];
+
+    for (int variant = 0; variant < 5; variant++) {
+      for (final ver in ['25', '20']) {
+        for (final e in [
+          [1, '01'],
+          [0, '00'],
+        ]) {
+          final addr = e[0] as int;
+          final info = e[1] as String;
+          final before = _frameCount;
+          await _send(
+            _paceCmd(ver, addr, 0x46, 0x42, info: info, variant: variant),
+            '[${names[variant]}] v$ver addr=$addr info=$info',
+          );
+          await Future.delayed(const Duration(milliseconds: 900));
+          if (_frameCount > before) {
+            _add('🎉🎉🎉 =========================');
+            _add('🎉 وصل رد! الصيغة الصحيحة:');
+            _add('🎉 checksum = ${names[variant]}');
+            _add('🎉 version = $ver | addr = $addr | info = $info');
+            _add('🎉 =========================');
+            setState(() => _busy = false);
+            return;
+          }
+        }
+      }
+    }
 
     _add('=================================');
-    _add('انتهى — الرسائل: $_frameCount | البايتات: $_byteCount');
+    _add('لا يوجد رد');
     setState(() => _busy = false);
   }
 
@@ -343,7 +431,12 @@ class _HomePageState extends State<HomePage> {
                   ElevatedButton.icon(
                     onPressed: (_busy || !connected) ? null : _probe,
                     icon: const Icon(Icons.travel_explore),
-                    label: const Text('فحص PACE'),
+                    label: const Text('مسح ١'),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: (_busy || !connected) ? null : _probe2,
+                    icon: const Icon(Icons.manage_search),
+                    label: const Text('مسح ٢'),
                   ),
                   if (connected)
                     ElevatedButton.icon(
