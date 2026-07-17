@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -9,22 +8,51 @@ void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'BMS Monitor',
+      title: 'مراقب البطارية',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true),
+      theme: ThemeData(
+        useMaterial3: true,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF00897B),
+          brightness: Brightness.dark,
+        ),
+      ),
       home: const HomePage(),
     );
   }
 }
 
-// UUIDs discovered from the battery
 final Guid kService = Guid('00002760-08c2-11e1-9073-0e8ac72e1001');
 final Guid kWriteChar = Guid('00002760-08c2-11e1-9073-0e8ac72e0001');
 final Guid kNotifyChar = Guid('00002760-08c2-11e1-9073-0e8ac72e0002');
+
+class BatteryData {
+  double current = 0;
+  double voltage = 0;
+  int soc = 0;
+  int soh = 0;
+  double remainAh = 0;
+  double fullAh = 0;
+  int cycles = 0;
+  int cellCount = 0;
+  List<double> cells = [];
+  double temp1 = 0;
+  double temp2 = 0;
+  double tempMos = 0;
+  DateTime? updated;
+
+  double get power => voltage * current;
+  bool get charging => current > 0.05;
+  bool get discharging => current < -0.05;
+  double get cellMin =>
+      cells.isEmpty ? 0 : cells.reduce((a, b) => a < b ? a : b);
+  double get cellMax =>
+      cells.isEmpty ? 0 : cells.reduce((a, b) => a > b ? a : b);
+  double get cellDelta => cells.isEmpty ? 0 : (cellMax - cellMin) * 1000;
+}
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -33,36 +61,51 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final List<String> _log = [];
   final List<ScanResult> _found = [];
   BluetoothDevice? _device;
   BluetoothCharacteristic? _write;
   BluetoothCharacteristic? _notify;
   StreamSubscription? _scanSub;
   StreamSubscription? _notifySub;
+  Timer? _poll;
+
+  final BatteryData _bat = BatteryData();
+  String _model = '';
+  String _serial = '';
+
   bool _busy = false;
-  int _frameCount = 0;
-  int _byteCount = 0;
+  bool _connected = false;
+  String _status = 'اضغط بحث للبدء';
 
-  void _add(String s) {
-    final t = DateTime.now();
-    final ts =
-        '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}.${t.millisecond.toString().padLeft(3, '0')}';
-    setState(() => _log.insert(0, '[$ts] $s'));
+  final List<int> _rx = [];
+
+  static int _crc16(List<int> data) {
+    int crc = 0xFFFF;
+    for (final b in data) {
+      crc ^= b;
+      for (int i = 0; i < 8; i++) {
+        crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xA001 : crc >> 1;
+      }
+    }
+    return crc;
   }
 
-  String _hex(List<int> d) =>
-      d.map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase()).join(' ');
-
-  // Show printable ASCII — PACE frames are readable text like ~25014642...
-  String _asciiOf(List<int> d) {
-    final printable = d.where((b) => b >= 0x20 && b <= 0x7E).length;
-    if (printable < d.length * 0.6) return '';
-    return String.fromCharCodes(
-        d.map((b) => (b >= 0x20 && b <= 0x7E) ? b : 0x2E));
+  static Uint8List _readCmd(int addr, int reg, int count) {
+    final b = <int>[
+      addr,
+      0x03,
+      (reg >> 8) & 0xFF,
+      reg & 0xFF,
+      (count >> 8) & 0xFF,
+      count & 0xFF,
+    ];
+    final crc = _crc16(b);
+    b.add(crc & 0xFF);
+    b.add((crc >> 8) & 0xFF);
+    return Uint8List.fromList(b);
   }
 
-  Future<void> _startScan() async {
+  Future<void> _scan() async {
     await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -72,44 +115,43 @@ class _HomePageState extends State<HomePage> {
     setState(() {
       _found.clear();
       _busy = true;
+      _status = 'جاري البحث...';
     });
-    _add('--- بدء البحث ---');
 
     _scanSub?.cancel();
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
         if (r.device.platformName.isEmpty) continue;
+        if (!r.device.platformName.toUpperCase().contains('BMS')) continue;
         if (_found.any((f) => f.device.remoteId == r.device.remoteId)) continue;
         setState(() => _found.add(r));
       }
     });
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 8));
-    await Future.delayed(const Duration(seconds: 8));
-    setState(() => _busy = false);
-    _add('--- انتهى البحث: ${_found.length} جهاز ---');
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
+    await Future.delayed(const Duration(seconds: 6));
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _status = _found.isEmpty ? 'لم يتم العثور على بطاريات' : 'اختر البطارية';
+    });
   }
 
   Future<void> _connect(BluetoothDevice d) async {
-    setState(() => _busy = true);
+    setState(() {
+      _busy = true;
+      _status = 'جاري الاتصال...';
+    });
     _device = d;
-    _add('محاولة الاتصال بـ ${d.platformName}');
 
     try {
       await FlutterBluePlus.stopScan();
       await d.connect(timeout: const Duration(seconds: 15));
-      _add('✅ تم الاتصال');
-
       try {
         await d.requestMtu(517);
-        _add('MTU = 517');
-      } catch (_) {
-        _add('MTU لم يتغير (عادي)');
-      }
+      } catch (_) {}
 
       final services = await d.discoverServices();
-      _add('عدد الخدمات: ${services.length}');
-
       for (final s in services) {
         if (s.uuid == kService) {
           for (final c in s.characteristics) {
@@ -120,274 +162,137 @@ class _HomePageState extends State<HomePage> {
       }
 
       if (_write == null || _notify == null) {
-        _add('❌ لم يتم العثور على الخدمة المطلوبة');
-        setState(() => _busy = false);
+        setState(() {
+          _busy = false;
+          _status = 'لم يتم العثور على خدمة البطارية';
+        });
         return;
       }
-      _add('✅ تم العثور على الخدمة');
 
       await _notify!.setNotifyValue(true);
-      _add('✅ تم تفعيل الاستقبال');
-
       _notifySub?.cancel();
-      _notifySub = _notify!.lastValueStream.listen((data) {
-        if (data.isEmpty) return;
-        _frameCount++;
-        _byteCount += data.length;
-        final ascii = _asciiOf(data);
-        _add('📥 [${data.length} بايت] ${_hex(data)}'
-            '${ascii.isEmpty ? "" : "\n     نص: $ascii"}');
+      _notifySub = _notify!.lastValueStream.listen(_onData);
+
+      setState(() {
+        _connected = true;
+        _busy = false;
+        _status = 'متصل';
       });
 
-      setState(() => _busy = false);
+      await Future.delayed(const Duration(milliseconds: 400));
+      await _send(_readCmd(0x01, 0x00AA, 35));
+      await Future.delayed(const Duration(milliseconds: 900));
+      _startPolling();
     } catch (e) {
-      _add('❌ خطأ: $e');
-      setState(() => _busy = false);
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _status = 'فشل الاتصال — حاول مرة أخرى';
+      });
     }
   }
 
-  // ---------- PACE (paceic) protocol ----------
-  // Format: ~ VER ADR CID1 CID2 LENGTH INFO CHKSUM CR
-  // All fields are ASCII hex characters.
-
-  // LENGTH field = 12-bit length + 4-bit checksum of that length
-  String _paceLength(int infoLen) {
-    if (infoLen == 0) return '0000';
-    final n = infoLen & 0xFFF;
-    int sum = ((n >> 8) & 0xF) + ((n >> 4) & 0xF) + (n & 0xF);
-    sum = ((~(sum & 0xFF)) + 1) & 0xF;
-    final v = (sum << 12) | n;
-    return v.toRadixString(16).toUpperCase().padLeft(4, '0');
+  void _startPolling() {
+    _poll?.cancel();
+    _refresh();
+    _poll = Timer.periodic(const Duration(seconds: 3), (_) => _refresh());
   }
 
-  // Frame checksum — several documented/plausible variants.
-  // variant 0: sum ASCII, invert, +1 (documented paceic)
-  // variant 1: sum ASCII, invert only
-  // variant 2: sum ASCII, plain
-  // variant 3: sum of hex nibble values, invert, +1
-  // variant 4: include leading '~' in sum, invert, +1
-  String _paceChecksum(String body, int variant) {
-    int sum = 0;
-    switch (variant) {
-      case 3:
-        for (final c in body.codeUnits) {
-          final v = int.tryParse(String.fromCharCode(c), radix: 16) ?? 0;
-          sum += v;
-        }
-        sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
-        break;
-      case 4:
-        sum = 0x7E;
-        for (final c in body.codeUnits) {
-          sum += c;
-        }
-        sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
-        break;
-      default:
-        for (final c in body.codeUnits) {
-          sum += c;
-        }
-        if (variant == 0) {
-          sum = ((~(sum & 0xFFFF)) + 1) & 0xFFFF;
-        } else if (variant == 1) {
-          sum = (~sum) & 0xFFFF;
-        } else {
-          sum = sum & 0xFFFF;
-        }
-    }
-    return sum.toRadixString(16).toUpperCase().padLeft(4, '0');
+  Future<void> _refresh() async {
+    if (_write == null) return;
+    await _send(_readCmd(0x01, 0x0000, 59));
   }
 
-  // Build a paceic frame. ver: '25' or '20'. addr: pack address. cid1: 0x46 (lithium)
-  Uint8List _paceCmd(String ver, int addr, int cid1, int cid2,
-      {String info = '', int variant = 0}) {
-    final a = addr.toRadixString(16).toUpperCase().padLeft(2, '0');
-    final c1 = cid1.toRadixString(16).toUpperCase().padLeft(2, '0');
-    final c2 = cid2.toRadixString(16).toUpperCase().padLeft(2, '0');
-    final len = _paceLength(info.length);
-    final body = '$ver$a$c1$c2$len$info';
-    final chk = _paceChecksum(body, variant);
-    final frame = '~$body$chk\r';
-    return Uint8List.fromList(frame.codeUnits);
-  }
-
-  // JK BMS command builder: 0xAA 0x55 0x90 0xEB, cmd, len, 4-byte value, pad to 19, checksum
-  Uint8List _jkCmd(int cmd, {int value = 0}) {
-    final b = Uint8List(20);
-    b[0] = 0xAA;
-    b[1] = 0x55;
-    b[2] = 0x90;
-    b[3] = 0xEB;
-    b[4] = cmd;
-    b[5] = 0x00;
-    b[6] = value & 0xFF;
-    b[7] = (value >> 8) & 0xFF;
-    b[8] = (value >> 16) & 0xFF;
-    b[9] = (value >> 24) & 0xFF;
-    int sum = 0;
-    for (int i = 0; i < 19; i++) {
-      sum += b[i];
-    }
-    b[19] = sum & 0xFF;
-    return b;
-  }
-
-  Future<void> _send(Uint8List cmd, String label) async {
-    if (_write == null) {
-      _add('❌ غير متصل');
-      return;
-    }
-    _add('📤 $label → ${_hex(cmd)}');
+  Future<void> _send(Uint8List cmd) async {
+    _rx.clear();
     try {
       await _write!.write(cmd, withoutResponse: true);
-    } catch (e) {
-      _add('❌ فشل الإرسال: $e');
+    } catch (_) {}
+  }
+
+  void _onData(List<int> data) {
+    if (data.isEmpty) return;
+    _rx.addAll(data);
+
+    if (_rx.length < 3) return;
+    if (_rx[1] != 0x03) {
+      _rx.clear();
+      return;
+    }
+    final byteCount = _rx[2];
+    final total = 3 + byteCount + 2;
+    if (_rx.length < total) return;
+
+    final frame = List<int>.from(_rx.sublist(0, total));
+    _rx.clear();
+
+    if (_crc16(frame) != 0) return;
+
+    final payload = frame.sublist(3, 3 + byteCount);
+    if (byteCount >= 110) {
+      _decodeLive(payload);
+    } else if (byteCount >= 60) {
+      _decodeInfo(payload);
     }
   }
 
-  Future<void> _runSequence() async {
-    setState(() {
-      _busy = true;
-      _frameCount = 0;
-      _byteCount = 0;
-    });
-    _add('=================================');
-    _add('بدء تسلسل الأوامر');
-
-    // Device info
-    await _send(_jkCmd(0x97), 'معلومات الجهاز (0x97)');
-    await Future.delayed(const Duration(milliseconds: 1500));
-
-    // Settings
-    await _send(_jkCmd(0x96), 'الإعدادات (0x96)');
-    await Future.delayed(const Duration(milliseconds: 1500));
-
-    // Live data
-    await _send(_jkCmd(0x96), 'البيانات الحية (0x96)');
-    await Future.delayed(const Duration(milliseconds: 2500));
-
-    _add('=================================');
-    _add('انتهى — الرسائل: $_frameCount | البايتات: $_byteCount');
-    setState(() => _busy = false);
+  int _u16(List<int> d, int i) => (d[i * 2] << 8) | d[i * 2 + 1];
+  int _s16(List<int> d, int i) {
+    final v = _u16(d, i);
+    return v > 32767 ? v - 65536 : v;
   }
 
-  Future<void> _probe() async {
-    setState(() {
-      _busy = true;
-      _frameCount = 0;
-      _byteCount = 0;
-    });
-    _add('=================================');
-    _add('مسح شامل — كل صيغ PACE');
-    _add('راح يتوقف تلقائياً عند أول رد');
+  void _decodeLive(List<int> d) {
+    if (d.length < 118) return;
+    final b = _bat;
+    b.current = _s16(d, 0) / 100.0;
+    b.voltage = _u16(d, 1) / 100.0;
+    b.soc = _u16(d, 2);
+    b.soh = _u16(d, 3);
+    b.remainAh = _u16(d, 5) / 100.0;
+    b.fullAh = _u16(d, 6) / 100.0;
+    b.cycles = _u16(d, 7);
+    b.cellCount = _u16(d, 15);
 
-    final names = [
-      'ascii-inv+1',
-      'ascii-inv',
-      'ascii-plain',
-      'nibble-inv+1',
-      'with-tilde',
-    ];
+    final n = b.cellCount.clamp(0, 16);
+    b.cells = List.generate(n, (i) => _u16(d, 16 + i) / 1000.0);
 
-    int tried = 0;
-    for (int variant = 0; variant < 5; variant++) {
-      for (final ver in ['25', '20']) {
-        for (final addr in [0, 1]) {
-          final before = _frameCount;
-          tried++;
-          await _send(
-            _paceCmd(ver, addr, 0x46, 0x42, info: '', variant: variant),
-            '[${names[variant]}] v$ver addr=$addr',
-          );
-          await Future.delayed(const Duration(milliseconds: 900));
-          if (_frameCount > before) {
-            _add('🎉🎉🎉 =========================');
-            _add('🎉 وصل رد! الصيغة الصحيحة:');
-            _add('🎉 checksum = ${names[variant]}');
-            _add('🎉 version = $ver | address = $addr');
-            _add('🎉 =========================');
-            setState(() => _busy = false);
-            return;
-          }
-        }
-      }
-    }
-
-    _add('=================================');
-    _add('جُرّبت $tried صيغة — لا يوجد رد');
-    setState(() => _busy = false);
+    b.temp1 = _u16(d, 47) / 10.0;
+    b.temp2 = _u16(d, 48) / 10.0;
+    b.tempMos = _u16(d, 57) / 10.0;
+    b.updated = DateTime.now();
+    if (mounted) setState(() {});
   }
 
-  // Send the same request with an info field (pack number), all variants
-  Future<void> _probe2() async {
+  void _decodeInfo(List<int> d) {
+    final txt = String.fromCharCodes(
+        d.map((c) => (c >= 0x20 && c <= 0x7E) ? c : 0x20));
+    final parts =
+        txt.trim().split(RegExp(r'\s{2,}')).where((s) => s.isNotEmpty).toList();
+    if (!mounted) return;
     setState(() {
-      _busy = true;
-      _frameCount = 0;
-      _byteCount = 0;
+      if (parts.isNotEmpty) _model = parts[0].trim();
+      if (parts.length > 1) _serial = parts[1].trim();
     });
-    _add('=================================');
-    _add('مسح ٢ — مع حقل معلومات');
-
-    final names = [
-      'ascii-inv+1',
-      'ascii-inv',
-      'ascii-plain',
-      'nibble-inv+1',
-      'with-tilde',
-    ];
-
-    for (int variant = 0; variant < 5; variant++) {
-      for (final ver in ['25', '20']) {
-        for (final e in [
-          [1, '01'],
-          [0, '00'],
-        ]) {
-          final addr = e[0] as int;
-          final info = e[1] as String;
-          final before = _frameCount;
-          await _send(
-            _paceCmd(ver, addr, 0x46, 0x42, info: info, variant: variant),
-            '[${names[variant]}] v$ver addr=$addr info=$info',
-          );
-          await Future.delayed(const Duration(milliseconds: 900));
-          if (_frameCount > before) {
-            _add('🎉🎉🎉 =========================');
-            _add('🎉 وصل رد! الصيغة الصحيحة:');
-            _add('🎉 checksum = ${names[variant]}');
-            _add('🎉 version = $ver | addr = $addr | info = $info');
-            _add('🎉 =========================');
-            setState(() => _busy = false);
-            return;
-          }
-        }
-      }
-    }
-
-    _add('=================================');
-    _add('لا يوجد رد');
-    setState(() => _busy = false);
   }
 
   Future<void> _disconnect() async {
+    _poll?.cancel();
     await _notifySub?.cancel();
     await _device?.disconnect();
+    if (!mounted) return;
     setState(() {
-      _device = null;
+      _connected = false;
       _write = null;
       _notify = null;
+      _bat.updated = null;
+      _status = 'اضغط بحث للبدء';
     });
-    _add('تم قطع الاتصال');
-  }
-
-  void _copyLog() {
-    Clipboard.setData(ClipboardData(text: _log.reversed.join('\n')));
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('تم نسخ السجل')),
-    );
   }
 
   @override
   void dispose() {
+    _poll?.cancel();
     _scanSub?.cancel();
     _notifySub?.cancel();
     super.dispose();
@@ -395,122 +300,244 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final connected = _write != null;
-
     return Directionality(
       textDirection: TextDirection.rtl,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('فاحص البطارية'),
+          title: const Text('مراقب البطارية'),
           actions: [
-            IconButton(icon: const Icon(Icons.copy), onPressed: _copyLog),
-            IconButton(
-                icon: const Icon(Icons.delete_outline),
-                onPressed: () => setState(() => _log.clear())),
+            if (_connected)
+              IconButton(
+                  icon: const Icon(Icons.link_off), onPressed: _disconnect),
           ],
         ),
-        body: Column(
-          children: [
-            if (_busy) const LinearProgressIndicator(),
-            Padding(
-              padding: const EdgeInsets.all(8),
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 8,
+        body: _connected ? _dashboard() : _scanView(),
+        floatingActionButton: _connected
+            ? null
+            : FloatingActionButton.extended(
+                onPressed: _busy ? null : _scan,
+                icon: const Icon(Icons.search),
+                label: const Text('بحث'),
+              ),
+      ),
+    );
+  }
+
+  Widget _scanView() {
+    return Column(
+      children: [
+        if (_busy) const LinearProgressIndicator(),
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(_status, style: const TextStyle(fontSize: 16)),
+        ),
+        Expanded(
+          child: ListView.builder(
+            itemCount: _found.length,
+            itemBuilder: (_, i) {
+              final r = _found[i];
+              return Card(
+                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                child: ListTile(
+                  leading: const Icon(Icons.battery_charging_full,
+                      color: Colors.green, size: 32),
+                  title: Text(r.device.platformName,
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text('قوة الإشارة: ${r.rssi} dBm'),
+                  trailing: const Icon(Icons.chevron_left),
+                  onTap: () => _connect(r.device),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _dashboard() {
+    final b = _bat;
+    if (b.updated == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    final statusText = b.charging
+        ? 'جاري الشحن'
+        : b.discharging
+            ? 'جاري التفريغ'
+            : 'ساكن';
+    final statusColor = b.charging
+        ? Colors.green
+        : b.discharging
+            ? Colors.orange
+            : Colors.grey;
+
+    return RefreshIndicator(
+      onRefresh: _refresh,
+      child: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
                 children: [
-                  ElevatedButton.icon(
-                    onPressed: _busy ? null : _startScan,
-                    icon: const Icon(Icons.search),
-                    label: const Text('بحث'),
-                  ),
-                  ElevatedButton.icon(
-                    onPressed: (_busy || !connected) ? null : _runSequence,
-                    icon: const Icon(Icons.play_arrow),
-                    label: const Text('تسلسل الأوامر'),
-                  ),
-                  ElevatedButton.icon(
-                    onPressed: (_busy || !connected) ? null : _probe,
-                    icon: const Icon(Icons.travel_explore),
-                    label: const Text('مسح ١'),
-                  ),
-                  ElevatedButton.icon(
-                    onPressed: (_busy || !connected) ? null : _probe2,
-                    icon: const Icon(Icons.manage_search),
-                    label: const Text('مسح ٢'),
-                  ),
-                  if (connected)
-                    ElevatedButton.icon(
-                      onPressed: _disconnect,
-                      icon: const Icon(Icons.link_off),
-                      label: const Text('قطع'),
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.red.shade900),
+                  Text('${b.soc}%',
+                      style: const TextStyle(
+                          fontSize: 64, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: LinearProgressIndicator(
+                      value: b.soc / 100,
+                      minHeight: 14,
+                      color: b.soc > 40
+                          ? Colors.green
+                          : b.soc > 20
+                              ? Colors.orange
+                              : Colors.red,
                     ),
+                  ),
+                  const SizedBox(height: 14),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: statusColor.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                    child: Text(statusText,
+                        style: TextStyle(
+                            color: statusColor, fontWeight: FontWeight.bold)),
+                  ),
                 ],
               ),
             ),
-            if (_found.isNotEmpty && !connected)
-              SizedBox(
-                height: 120,
-                child: ListView.builder(
-                  itemCount: _found.length,
-                  itemBuilder: (_, i) {
-                    final r = _found[i];
-                    final isBms =
-                        r.device.platformName.toUpperCase().contains('BMS');
-                    return ListTile(
-                      dense: true,
-                      leading: Icon(Icons.bluetooth,
-                          color: isBms ? Colors.green : Colors.grey),
-                      title: Text(r.device.platformName,
-                          style: TextStyle(
-                              fontWeight:
-                                  isBms ? FontWeight.bold : FontWeight.normal)),
-                      subtitle: Text('${r.device.remoteId} • ${r.rssi} dBm'),
-                      trailing: const Icon(Icons.chevron_left),
-                      onTap: () => _connect(r.device),
-                    );
-                  },
-                ),
-              ),
-            if (connected)
-              Container(
-                width: double.infinity,
-                color: Colors.green.shade900,
-                padding: const EdgeInsets.all(8),
-                child: Text(
-                  'متصل: ${_device?.platformName ?? ""}  |  الرسائل: $_frameCount  |  البايتات: $_byteCount',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            const Divider(height: 1),
-            Expanded(
-              child: Container(
-                color: Colors.black,
-                child: ListView.builder(
-                  padding: const EdgeInsets.all(8),
-                  itemCount: _log.length,
-                  itemBuilder: (_, i) {
-                    final line = _log[i];
-                    Color c = Colors.white70;
-                    if (line.contains('📥')) c = Colors.greenAccent;
-                    if (line.contains('📤')) c = Colors.cyanAccent;
-                    if (line.contains('❌')) c = Colors.redAccent;
-                    if (line.contains('✅')) c = Colors.lightGreenAccent;
+          ),
+          Row(children: [
+            _tile('الجهد', '${b.voltage.toStringAsFixed(2)} V', Icons.bolt,
+                Colors.amber),
+            _tile(
+                'التيار',
+                '${b.current.abs().toStringAsFixed(2)} A',
+                b.charging ? Icons.arrow_downward : Icons.arrow_upward,
+                b.charging ? Colors.green : Colors.orange),
+          ]),
+          Row(children: [
+            _tile('القدرة', '${b.power.abs().toStringAsFixed(0)} W',
+                Icons.flash_on, Colors.purple),
+            _tile('الصحة', '${b.soh}%', Icons.favorite, Colors.pink),
+          ]),
+          Row(children: [
+            _tile('المتبقي', '${b.remainAh.toStringAsFixed(0)} Ah',
+                Icons.battery_5_bar, Colors.teal),
+            _tile('السعة الكلية', '${b.fullAh.toStringAsFixed(0)} Ah',
+                Icons.battery_full, Colors.blue),
+          ]),
+          Row(children: [
+            _tile('الدورات', '${b.cycles}', Icons.loop, Colors.indigo),
+            _tile('فرق الخلايا', '${b.cellDelta.toStringAsFixed(0)} mV',
+                Icons.compare_arrows, Colors.deepOrange),
+          ]),
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('جهد الخلايا',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 12),
+                  ...List.generate(b.cells.length, (i) {
+                    final v = b.cells[i];
+                    final isMin = v == b.cellMin && b.cellDelta > 5;
+                    final isMax = v == b.cellMax && b.cellDelta > 5;
                     return Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 2),
-                      child: Text(
-                        line,
-                        textDirection: TextDirection.ltr,
-                        style: TextStyle(
-                            fontFamily: 'monospace', fontSize: 11, color: c),
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Row(
+                        children: [
+                          SizedBox(width: 60, child: Text('خلية ${i + 1}')),
+                          Expanded(
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(4),
+                              child: LinearProgressIndicator(
+                                value: ((v - 2.5) / (3.65 - 2.5)).clamp(0, 1),
+                                minHeight: 8,
+                                color: isMin
+                                    ? Colors.red
+                                    : isMax
+                                        ? Colors.blue
+                                        : Colors.green,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Text('${v.toStringAsFixed(3)} V',
+                              style: const TextStyle(
+                                  fontFamily: 'monospace', fontSize: 13)),
+                        ],
                       ),
                     );
-                  },
+                  }),
+                ],
+              ),
+            ),
+          ),
+          Row(children: [
+            _tile('حرارة ١', '${b.temp1.toStringAsFixed(1)}°', Icons.thermostat,
+                Colors.red),
+            _tile('حرارة ٢', '${b.temp2.toStringAsFixed(1)}°', Icons.thermostat,
+                Colors.red),
+            _tile('MOS', '${b.tempMos.toStringAsFixed(1)}°', Icons.memory,
+                Colors.redAccent),
+          ]),
+          if (_model.isNotEmpty)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('الموديل: $_model',
+                        style: const TextStyle(fontSize: 13)),
+                    if (_serial.isNotEmpty)
+                      Text('الرقم: $_serial',
+                          style: const TextStyle(fontSize: 13)),
+                  ],
                 ),
               ),
             ),
-          ],
+          Padding(
+            padding: const EdgeInsets.all(10),
+            child: Text(
+              'آخر تحديث: ${b.updated!.hour.toString().padLeft(2, '0')}:${b.updated!.minute.toString().padLeft(2, '0')}:${b.updated!.second.toString().padLeft(2, '0')}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tile(String label, String value, IconData icon, Color color) {
+    return Expanded(
+      child: Card(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 6),
+          child: Column(
+            children: [
+              Icon(icon, color: color, size: 26),
+              const SizedBox(height: 6),
+              Text(value,
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 2),
+              Text(label,
+                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+            ],
+          ),
         ),
       ),
     );
