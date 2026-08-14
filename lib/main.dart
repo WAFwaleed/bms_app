@@ -56,6 +56,25 @@ Uint8List readCmd(int addr, int reg, int count) {
   return Uint8List.fromList(b);
 }
 
+// ============ RTL-safe text helpers ============
+// Arabic letters written as Unicode escapes so that source lines which also
+// contain code (interpolation, operators) never get reordered by editors.
+const String _hourLetter = '\u0633'; // س
+const String _minLetter = '\u062F'; // د
+const String kUntilFull = '\u062D\u062A\u0649 \u0627\u0644\u0627\u0645\u062A\u0644\u0627\u0621';
+const String kUntilEmpty = '\u062D\u062A\u0649 \u0627\u0644\u0641\u0631\u0627\u063A';
+const String kTimeLeft = '\u0627\u0644\u0648\u0642\u062A \u0627\u0644\u0645\u062A\u0628\u0642\u064A';
+
+String formatHours(double? h) {
+  if (h == null) return '\u2014';
+  if (h > 99) return '+99 $_hourLetter';
+  final total = (h * 60).round();
+  final hh = total ~/ 60;
+  final mm = total % 60;
+  if (hh == 0) return '$mm $_minLetter';
+  return '$hh $_hourLetter $mm $_minLetter';
+}
+
 // ============ Battery model ============
 class Battery {
   final String id;
@@ -99,23 +118,14 @@ class Battery {
     return toFill / current.abs();
   }
 
-  /// Formatted like "5 س 30 د"
-  String get timeText {
-    final h = hoursRemaining;
-    if (h == null) return '—';
-    if (h > 99) return '+99 س';
-    final total = (h * 60).round();
-    final hh = total ~/ 60;
-    final mm = total % 60;
-    if (hh == 0) return '$mm د';
-    return '$hh س $mm د';
-  }
+  /// Formatted like "5h 30m" using Arabic letter escapes (RTL-safe source)
+  String get timeText => formatHours(hoursRemaining);
 
-  String get timeLabel => charging
-      ? 'حتى الامتلاء'
-      : discharging
-          ? 'حتى الفراغ'
-          : 'الوقت المتبقي';
+  String get timeLabel {
+    if (charging) return kUntilFull;
+    if (discharging) return kUntilEmpty;
+    return kTimeLeft;
+  }
 
   double get cellMin =>
       cells.isEmpty ? 0 : cells.reduce((a, b) => a < b ? a : b);
@@ -389,22 +399,13 @@ class _HomePageState extends State<HomePage> {
     return toFill / i;
   }
 
-  String get _sysTimeText {
-    final h = _sysHours;
-    if (h == null) return '—';
-    if (h > 99) return '+99 س';
-    final total = (h * 60).round();
-    final hh = total ~/ 60;
-    final mm = total % 60;
-    if (hh == 0) return '$mm د';
-    return '$hh س $mm د';
-  }
+  String get _sysTimeText => formatHours(_sysHours);
 
-  String get _sysTimeLabel => _totalCurrent > 0.5
-      ? 'حتى الامتلاء'
-      : _totalCurrent < -0.5
-          ? 'حتى الفراغ'
-          : 'الوقت المتبقي';
+  String get _sysTimeLabel {
+    if (_totalCurrent > 0.5) return kUntilFull;
+    if (_totalCurrent < -0.5) return kUntilEmpty;
+    return kTimeLeft;
+  }
 
   @override
   void dispose() {
@@ -718,7 +719,9 @@ class _HomePageState extends State<HomePage> {
                               '${b.remainAh.toStringAsFixed(0)} Ah'),
                           _kv(b.timeLabel, b.timeText),
                           _kv('الحرارة',
-                              '${b.temp1.toStringAsFixed(1)}°  |  فرق ${b.cellDelta.toStringAsFixed(0)}mV'),
+                              '${b.temp1.toStringAsFixed(1)}\u00B0'),
+                          _kv('فرق الخلايا',
+                              '${b.cellDelta.toStringAsFixed(0)} mV'),
                         ],
                       ),
                     ),
