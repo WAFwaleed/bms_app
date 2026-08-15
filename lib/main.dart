@@ -102,8 +102,10 @@ class Battery {
   Battery(this.id, this.name);
 
   double get power => voltage * current;
-  bool get charging => current > 0.05;
-  bool get discharging => current < -0.05;
+  // NOTE: This BMS reports POSITIVE current while discharging and NEGATIVE
+  // while charging — verified against the official app during live capture.
+  bool get charging => current < -0.05;
+  bool get discharging => current > 0.05;
 
   /// Hours until empty (discharging) or until full (charging).
   /// null when idle or current too small to be meaningful.
@@ -387,11 +389,12 @@ class _HomePageState extends State<HomePage> {
       ? 0
       : _live.fold(0.0, (s, b) => s + b.voltage) / _live.length;
 
-  /// System-wide hours remaining, using total capacity and total current
+  /// System-wide hours remaining, using total capacity and total current.
+  /// Positive total current = discharging (see Battery sign note).
   double? get _sysHours {
     final i = _totalCurrent.abs();
     if (i < 0.5) return null;
-    if (_totalCurrent < 0) {
+    if (_totalCurrent > 0) {
       return _totalRemain / i;
     }
     final toFill = _totalFull - _totalRemain;
@@ -402,8 +405,8 @@ class _HomePageState extends State<HomePage> {
   String get _sysTimeText => formatHours(_sysHours);
 
   String get _sysTimeLabel {
-    if (_totalCurrent > 0.5) return kUntilFull;
-    if (_totalCurrent < -0.5) return kUntilEmpty;
+    if (_totalCurrent < -0.5) return kUntilFull;
+    if (_totalCurrent > 0.5) return kUntilEmpty;
     return kTimeLeft;
   }
 
@@ -562,7 +565,7 @@ class _HomePageState extends State<HomePage> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(
-                        _totalCurrent > 0.5
+                        _totalCurrent < -0.5
                             ? Icons.battery_charging_full
                             : Icons.timelapse,
                         size: 22,
