@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() => runApp(const MyApp());
 
@@ -64,6 +65,10 @@ const String _minLetter = '\u062F'; // د
 const String kUntilFull = '\u062D\u062A\u0649 \u0627\u0644\u0627\u0645\u062A\u0644\u0627\u0621';
 const String kUntilEmpty = '\u062D\u062A\u0649 \u0627\u0644\u0641\u0631\u0627\u063A';
 const String kTimeLeft = '\u0627\u0644\u0648\u0642\u062A \u0627\u0644\u0645\u062A\u0628\u0642\u064A';
+// "الآن" / "ثانية" / "دقيقة"
+const String kJustNow = '\u0627\u0644\u0622\u0646';
+const String kSecondsAgo = '\u062B\u0627\u0646\u064A\u0629';
+const String kMinutesAgo = '\u062F\u0642\u064A\u0642\u0629';
 
 String formatHours(double? h) {
   if (h == null) return '\u2014';
@@ -80,6 +85,12 @@ class Battery {
   final String id;
   final String name;
   BluetoothDevice? device;
+
+  /// User-assigned label, e.g. "بطارية اليمين". Empty = use device name.
+  String customName = '';
+
+  /// Whether this battery belongs to the selected system (caravan).
+  bool enabled = true;
 
   double current = 0;
   double voltage = 0;
@@ -137,10 +148,18 @@ class Battery {
   bool get stale =>
       updated == null || DateTime.now().difference(updated!).inSeconds > 45;
 
-  /// Short label e.g. "…159P"
+  /// Name to show in the UI — custom label if set, otherwise device name.
+  String get displayName => customName.isNotEmpty ? customName : name;
+
+  /// Short label e.g. "…159P" or the custom name
   String get shortName {
+    if (customName.isNotEmpty) {
+      return customName.length <= 12
+          ? customName
+          : '${customName.substring(0, 11)}…';
+    }
     if (name.length <= 5) return name;
-    return '…${name.substring(name.length - 5)}';
+    return '\u2026${name.substring(name.length - 5)}';
   }
 }
 
@@ -164,8 +183,58 @@ class _HomePageState extends State<HomePage> {
   String? _focusId;
 
   Timer? _loop;
+  Timer? _tick;
   int _rrIndex = 0;
   bool _cycleBusy = false;
+
+  /// True once the user has chosen which batteries belong to this system.
+  bool _configured = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPrefs();
+    // Refresh the "x seconds ago" label once per second
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted && _lastUpdate != null) setState(() {});
+    });
+  }
+
+  // ---------- Persistence ----------
+  Future<void> _loadPrefs() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      _configured = p.getBool('configured') ?? false;
+      final saved = p.getStringList('batteries') ?? [];
+      for (final entry in saved) {
+        // format: id|deviceName|customName|enabled
+        final parts = entry.split('|');
+        if (parts.length < 4) continue;
+        final b = Battery(parts[0], parts[1]);
+        b.customName = parts[2];
+        b.enabled = parts[3] == '1';
+        _batteries[b.id] = b;
+        _order.add(b.id);
+      }
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  Future<void> _savePrefs() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final list = _order.map((id) {
+        final b = _batteries[id]!;
+        return '${b.id}|${b.name}|${b.customName}|${b.enabled ? '1' : '0'}';
+      }).toList();
+      await p.setStringList('batteries', list);
+      await p.setBool('configured', _configured);
+    } catch (_) {}
+  }
+
+  /// Batteries that belong to this system
+  List<Battery> get _active =>
+      _order.map((i) => _batteries[i]!).where((b) => b.enabled).toList();
 
   // ---------- Scanning ----------
   Future<void> _scan() async {
@@ -189,6 +258,9 @@ class _HomePageState extends State<HomePage> {
         if (!_batteries.containsKey(id)) {
           final b = Battery(id, n.trim());
           b.device = r.device;
+          // New batteries found after setup default to OFF so a pack from a
+          // neighbouring caravan never joins this system by accident.
+          b.enabled = !_configured;
           _batteries[id] = b;
           _order.add(id);
           setState(() {});
@@ -201,6 +273,7 @@ class _HomePageState extends State<HomePage> {
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
     await Future.delayed(const Duration(seconds: 6));
     if (!mounted) return;
+    await _savePrefs();
     setState(() {
       _scanning = false;
       _status = _batteries.isEmpty
@@ -334,12 +407,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ---------- Monitoring loop ----------
-  void _startMonitor() {
+  void _startMonitor() async {
     if (_batteries.isEmpty) return;
     setState(() {
       _monitoring = true;
       _status = 'المراقبة نشطة';
     });
+    // Batteries restored from storage have no BLE handle yet — find them first.
+    if (_active.any((b) => b.device == null)) {
+      await _scan();
+      if (!mounted || !_monitoring) return;
+    }
     _loop?.cancel();
     _cycle();
     _loop = Timer.periodic(const Duration(seconds: 2), (_) => _cycle());
@@ -361,11 +439,12 @@ class _HomePageState extends State<HomePage> {
         final b = _batteries[_focusId];
         if (b != null) await _readBattery(b);
       } else {
-        if (_order.isEmpty) return;
-        _rrIndex = _rrIndex % _order.length;
-        final b = _batteries[_order[_rrIndex]];
+        final act = _active;
+        if (act.isEmpty) return;
+        _rrIndex = _rrIndex % act.length;
+        final b = act[_rrIndex];
         _rrIndex++;
-        if (b != null) await _readBattery(b);
+        await _readBattery(b);
       }
     } finally {
       _cycleBusy = false;
@@ -373,8 +452,41 @@ class _HomePageState extends State<HomePage> {
   }
 
   // ---------- Totals ----------
-  List<Battery> get _live =>
-      _order.map((i) => _batteries[i]!).where((b) => b.updated != null).toList();
+  List<Battery> get _live => _order
+      .map((i) => _batteries[i]!)
+      .where((b) => b.enabled && b.updated != null)
+      .toList();
+
+  /// Most recent successful read across the system
+  DateTime? get _lastUpdate {
+    DateTime? latest;
+    for (final b in _live) {
+      if (b.updated == null) continue;
+      if (latest == null || b.updated!.isAfter(latest)) latest = b.updated;
+    }
+    return latest;
+  }
+
+  /// Oldest read among active batteries — shows if one is lagging
+  DateTime? get _oldestUpdate {
+    DateTime? oldest;
+    for (final b in _live) {
+      if (b.updated == null) continue;
+      if (oldest == null || b.updated!.isBefore(oldest)) oldest = b.updated;
+    }
+    return oldest;
+  }
+
+  String _clock(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
+
+  String _ago(DateTime t) {
+    final s = DateTime.now().difference(t).inSeconds;
+    if (s < 5) return kJustNow;
+    if (s < 60) return '$s ${kSecondsAgo}';
+    final m = s ~/ 60;
+    return '$m ${kMinutesAgo}';
+  }
 
   double get _totalCurrent =>
       _live.fold(0.0, (s, b) => s + b.current);
@@ -412,6 +524,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _loop?.cancel();
+    _tick?.cancel();
     _scanSub?.cancel();
     super.dispose();
   }
@@ -425,11 +538,17 @@ class _HomePageState extends State<HomePage> {
         appBar: AppBar(
           title: const Text('مراقب البطاريات'),
           actions: [
-            if (_batteries.isNotEmpty)
+            if (_batteries.isNotEmpty) ...[
+              IconButton(
+                icon: const Icon(Icons.tune),
+                tooltip: 'إدارة البطاريات',
+                onPressed: _openManager,
+              ),
               IconButton(
                 icon: Icon(_monitoring ? Icons.pause : Icons.play_arrow),
                 onPressed: _monitoring ? _stopMonitor : _startMonitor,
               ),
+            ],
           ],
         ),
         body: _batteries.isEmpty ? _empty() : _main(),
@@ -442,6 +561,185 @@ class _HomePageState extends State<HomePage> {
             : null,
       ),
     );
+  }
+
+  // ---------- Battery management ----------
+  void _openManager() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: StatefulBuilder(
+          builder: (ctx2, setSheet) => DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.8,
+            builder: (_, scroll) => Column(
+              children: [
+                const SizedBox(height: 14),
+                const Text('إدارة البطاريات',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                  child: Text(
+                    'حدد البطاريات التابعة لهذه المنظومة فقط. غير المحددة لن تُقرأ ولن تدخل في الإجمالي.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: ListView(
+                    controller: scroll,
+                    children: [
+                      ..._order.map((id) {
+                        final b = _batteries[id]!;
+                        return CheckboxListTile(
+                          value: b.enabled,
+                          onChanged: (v) {
+                            setSheet(() => b.enabled = v ?? false);
+                            setState(() {
+                              if (!b.enabled && _focusId == b.id) {
+                                _focusId = null;
+                              }
+                            });
+                            _savePrefs();
+                          },
+                          title: Text(b.displayName,
+                              style: const TextStyle(
+                                  fontWeight: FontWeight.bold, fontSize: 14)),
+                          subtitle: Text(
+                            b.customName.isEmpty ? b.id : b.name,
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                          secondary: IconButton(
+                            icon: const Icon(Icons.edit, size: 20),
+                            onPressed: () async {
+                              await _renameDialog(b);
+                              setSheet(() {});
+                            },
+                          ),
+                        );
+                      }),
+                      const Divider(),
+                      Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          children: [
+                            SizedBox(
+                              width: double.infinity,
+                              child: OutlinedButton.icon(
+                                icon: const Icon(Icons.search),
+                                label: const Text('بحث عن بطاريات جديدة'),
+                                onPressed: _scanning
+                                    ? null
+                                    : () async {
+                                        await _scan();
+                                        setSheet(() {});
+                                      },
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            SizedBox(
+                              width: double.infinity,
+                              child: TextButton.icon(
+                                icon: const Icon(Icons.delete_outline,
+                                    color: Colors.redAccent),
+                                label: const Text('حذف غير المحددة',
+                                    style: TextStyle(color: Colors.redAccent)),
+                                onPressed: () {
+                                  setState(() {
+                                    final rm = _order
+                                        .where((i) => !_batteries[i]!.enabled)
+                                        .toList();
+                                    for (final i in rm) {
+                                      _batteries.remove(i);
+                                      _order.remove(i);
+                                      if (_focusId == i) _focusId = null;
+                                    }
+                                  });
+                                  _savePrefs();
+                                  setSheet(() {});
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: () {
+                          setState(() => _configured = true);
+                          _savePrefs();
+                          Navigator.pop(ctx2);
+                        },
+                        child: const Text('حفظ'),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _renameDialog(Battery b) async {
+    final ctrl = TextEditingController(text: b.customName);
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text('تسمية البطارية'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(b.name,
+                  style: const TextStyle(fontSize: 11, color: Colors.grey)),
+              const SizedBox(height: 12),
+              TextField(
+                controller: ctrl,
+                autofocus: true,
+                decoration: const InputDecoration(
+                  hintText: 'مثال: بطارية اليمين',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, '\u0000'),
+              child: const Text('إزالة'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('إلغاء'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+              child: const Text('حفظ'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    if (result == null) return;
+    setState(() => b.customName = result == '\u0000' ? '' : result);
+    await _savePrefs();
   }
 
   Widget _empty() {
@@ -472,17 +770,16 @@ class _HomePageState extends State<HomePage> {
                 _modeChip('الكل', _focusId == null, () {
                   setState(() => _focusId = null);
                 }),
-                ..._order.map((id) {
-                  final b = _batteries[id]!;
-                  return _modeChip(b.shortName, _focusId == id, () {
-                    setState(() => _focusId = id);
+                ..._active.map((b) {
+                  return _modeChip(b.shortName, _focusId == b.id, () {
+                    setState(() => _focusId = b.id);
                   });
                 }),
                 const SizedBox(width: 6),
                 ActionChip(
-                  avatar: const Icon(Icons.refresh, size: 18),
-                  label: const Text('بحث'),
-                  onPressed: _scanning ? null : _scan,
+                  avatar: const Icon(Icons.tune, size: 18),
+                  label: const Text('إدارة'),
+                  onPressed: _openManager,
                 ),
               ],
             ),
@@ -532,7 +829,7 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const SizedBox(height: 4),
-                Text('مراقبة ${live.length} من ${_batteries.length} بطارية',
+                Text('مراقبة ${live.length} من ${_active.length} بطارية',
                     style:
                         const TextStyle(fontSize: 11, color: Colors.grey)),
                 const SizedBox(height: 14),
@@ -609,16 +906,60 @@ class _HomePageState extends State<HomePage> {
           ),
         ),
         const SizedBox(height: 6),
-        // Each battery card
-        ..._order.map((id) => _batteryCard(_batteries[id]!)),
-        const SizedBox(height: 12),
+        // Each battery card (active only)
+        ..._active.map((b) => _batteryCard(b)),
+        const SizedBox(height: 14),
+        // Last update line
+        if (_lastUpdate != null)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.update,
+                      size: 18,
+                      color: _monitoring ? Colors.tealAccent : Colors.grey),
+                  const SizedBox(width: 10),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          const Text('آخر تحديث: ',
+                              style: TextStyle(
+                                  fontSize: 12, color: Colors.grey)),
+                          Text(_clock(_lastUpdate!),
+                              style: const TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                  fontFeatures: [])),
+                          const SizedBox(width: 6),
+                          Text('(${_ago(_lastUpdate!)})',
+                              style: const TextStyle(
+                                  fontSize: 11, color: Colors.grey)),
+                        ],
+                      ),
+                      if (_oldestUpdate != null &&
+                          _lastUpdate!.difference(_oldestUpdate!).inSeconds > 3)
+                        Text('أقدم قراءة: ${_clock(_oldestUpdate!)}',
+                            style: const TextStyle(
+                                fontSize: 10, color: Colors.grey)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        const SizedBox(height: 6),
         Text(
           _monitoring
-              ? 'التحديث بالتناوب — كل بطارية كل ~${_batteries.length * 4} ثانية'
+              ? 'التحديث بالتناوب — كل بطارية كل ~${_active.length * 4} ثانية'
               : 'المراقبة متوقفة — اضغط ▶ للتشغيل',
           textAlign: TextAlign.center,
           style: const TextStyle(fontSize: 11, color: Colors.grey),
         ),
+        const SizedBox(height: 12),
       ],
     );
   }
@@ -668,7 +1009,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: Text(b.name,
+                    child: Text(b.displayName,
                         style: const TextStyle(
                             fontWeight: FontWeight.bold, fontSize: 13),
                         overflow: TextOverflow.ellipsis),
@@ -788,8 +1129,28 @@ class _HomePageState extends State<HomePage> {
             padding: const EdgeInsets.all(20),
             child: Column(
               children: [
-                Text(b.name,
-                    style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Flexible(
+                      child: Text(b.displayName,
+                          style: TextStyle(
+                              fontSize: b.customName.isEmpty ? 12 : 15,
+                              fontWeight: b.customName.isEmpty
+                                  ? FontWeight.normal
+                                  : FontWeight.bold,
+                              color: b.customName.isEmpty
+                                  ? Colors.grey
+                                  : null),
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.edit, size: 16),
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => _renameDialog(b),
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 8),
                 Text('${b.soc}%',
                     style: const TextStyle(
