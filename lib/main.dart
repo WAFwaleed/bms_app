@@ -26,9 +26,30 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// ---- PACE (Modbus RTU over BLE) ----
 final Guid kService = Guid('00002760-08c2-11e1-9073-0e8ac72e1001');
 final Guid kWriteChar = Guid('00002760-08c2-11e1-9073-0e8ac72e0001');
 final Guid kNotifyChar = Guid('00002760-08c2-11e1-9073-0e8ac72e0002');
+
+// ---- JBD / Xiaoxiang (used by Kfo SP04S060L4S300A packs) ----
+const String kJbdService = 'ff00';
+const String kJbdNotify = 'ff01';
+const String kJbdWrite = 'ff02';
+
+/// Compares a discovered Guid against a 16-bit short UUID such as "ff00".
+bool uuidIs(Guid g, String short) {
+  final s = g.toString().toLowerCase().replaceAll('-', '');
+  if (s.length <= 4) return s == short;
+  if (s.length != 32) return false;
+  return s.substring(4, 8) == short && s.endsWith('00001000800000805f9b34fb');
+}
+
+/// Builds a JBD request frame: DD A5 <cmd> 00 <checksum> 77
+Uint8List jbdCmd(int cmd) {
+  final cs = 0x10000 - cmd;
+  return Uint8List.fromList(
+      [0xDD, 0xA5, cmd, 0x00, (cs >> 8) & 0xFF, cs & 0xFF, 0x77]);
+}
 
 // ============ Modbus RTU ============
 int crc16(List<int> data) {
@@ -105,6 +126,18 @@ class Battery {
   double temp1 = 0, temp2 = 0, tempMos = 0;
   String model = '';
   String serial = '';
+
+  /// Detected BMS protocol: 'pace' or 'jbd'. Empty until first connect.
+  String protocol = '';
+  bool chgMos = false;
+  bool disMos = false;
+  bool protect = false;
+
+  String get protocolLabel {
+    if (protocol == 'pace') return 'PACE';
+    if (protocol == 'jbd') return 'JBD';
+    return '\u2014';
+  }
 
   DateTime? updated;
   bool online = false;
@@ -190,6 +223,36 @@ class _HomePageState extends State<HomePage> {
   /// True once the user has chosen which batteries belong to this system.
   bool _configured = false;
 
+  /// When true the scan lists every named BLE device, not just likely BMS ones.
+  bool _showAll = false;
+
+  /// Heuristic: does this advertisement look like a supported BMS?
+  bool _looksLikeBms(ScanResult r) {
+    final n = r.device.platformName.trim();
+    if (n.isEmpty) return false;
+    if (_showAll) return true;
+    for (final s in r.advertisementData.serviceUuids) {
+      if (s == kService) return true;
+      if (uuidIs(s, kJbdService)) return true;
+      if (uuidIs(s, 'ffe0')) return true;
+    }
+    final u = n.toUpperCase();
+    const patterns = [
+      'BMS',
+      'SP0',
+      'SP4',
+      'JBD',
+      'XIAOXIANG',
+      'JK-',
+      'JK_',
+      'DL-',
+      'LFP',
+      'LIFEPO',
+      'BATT',
+    ];
+    return patterns.any((p) => u.contains(p));
+  }
+
   @override
   void initState() {
     super.initState();
@@ -207,12 +270,13 @@ class _HomePageState extends State<HomePage> {
       _configured = p.getBool('configured') ?? false;
       final saved = p.getStringList('batteries') ?? [];
       for (final entry in saved) {
-        // format: id|deviceName|customName|enabled
+        // format: id|deviceName|customName|enabled|protocol
         final parts = entry.split('|');
         if (parts.length < 4) continue;
         final b = Battery(parts[0], parts[1]);
         b.customName = parts[2];
         b.enabled = parts[3] == '1';
+        if (parts.length > 4) b.protocol = parts[4];
         _batteries[b.id] = b;
         _order.add(b.id);
       }
@@ -225,7 +289,8 @@ class _HomePageState extends State<HomePage> {
       final p = await SharedPreferences.getInstance();
       final list = _order.map((id) {
         final b = _batteries[id]!;
-        return '${b.id}|${b.name}|${b.customName}|${b.enabled ? '1' : '0'}';
+        return '${b.id}|${b.name}|${b.customName}|'
+            '${b.enabled ? '1' : '0'}|${b.protocol}';
       }).toList();
       await p.setStringList('batteries', list);
       await p.setBool('configured', _configured);
@@ -253,7 +318,7 @@ class _HomePageState extends State<HomePage> {
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (final r in results) {
         final n = r.device.platformName;
-        if (n.isEmpty || !n.toUpperCase().contains('BMS')) continue;
+        if (!_looksLikeBms(r)) continue;
         final id = r.device.remoteId.str;
         if (!_batteries.containsKey(id)) {
           final b = Battery(id, n.trim());
@@ -292,8 +357,11 @@ class _HomePageState extends State<HomePage> {
     final rx = <int>[];
     final done = Completer<bool>();
     bool gotLive = false;
+    bool gotCells = false;
+    String proto = '';
 
-    void handle(List<int> data) {
+    // ---- PACE: Modbus RTU frames ----
+    void handlePace(List<int> data) {
       if (data.isEmpty) return;
       rx.addAll(data);
       if (rx.length < 3) return;
@@ -317,6 +385,38 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
+    // ---- JBD: DD/A5 frames, may arrive split across notifications ----
+    void handleJbd(List<int> data) {
+      if (data.isEmpty) return;
+      rx.addAll(data);
+      while (true) {
+        final start = rx.indexOf(0xDD);
+        if (start < 0) {
+          rx.clear();
+          return;
+        }
+        if (start > 0) rx.removeRange(0, start);
+        if (rx.length < 4) return;
+        final cmd = rx[1];
+        final status = rx[2];
+        final len = rx[3];
+        final total = 4 + len + 3; // header + payload + checksum + 0x77
+        if (rx.length < total) return;
+        final frame = List<int>.from(rx.sublist(0, total));
+        rx.removeRange(0, total);
+        if (frame[total - 1] != 0x77 || status != 0x00) continue;
+        final p = frame.sublist(4, 4 + len);
+        if (cmd == 0x03) {
+          _decodeJbdBasic(b, p);
+          gotLive = true;
+        } else if (cmd == 0x04) {
+          _decodeJbdCells(b, p);
+          gotCells = true;
+        }
+        if (gotLive && gotCells && !done.isCompleted) done.complete(true);
+      }
+    }
+
     try {
       await d.connect(timeout: const Duration(seconds: 8));
       try {
@@ -324,36 +424,71 @@ class _HomePageState extends State<HomePage> {
       } catch (_) {}
 
       final services = await d.discoverServices();
+
+      // Auto-detect which protocol this pack speaks.
       for (final s in services) {
         if (s.uuid == kService) {
           for (final c in s.characteristics) {
             if (c.uuid == kWriteChar) wc = c;
             if (c.uuid == kNotifyChar) nc = c;
           }
+          if (wc != null && nc != null) {
+            proto = 'pace';
+            break;
+          }
+        }
+        if (uuidIs(s.uuid, kJbdService)) {
+          BluetoothCharacteristic? jw, jn;
+          for (final c in s.characteristics) {
+            if (uuidIs(c.uuid, kJbdWrite)) jw = c;
+            if (uuidIs(c.uuid, kJbdNotify)) jn = c;
+          }
+          if (jw != null && jn != null) {
+            wc = jw;
+            nc = jn;
+            proto = 'jbd';
+            break;
+          }
         }
       }
-      if (wc == null || nc == null) {
+
+      if (wc == null || nc == null || proto.isEmpty) {
         await d.disconnect();
         return false;
       }
 
-      await nc.setNotifyValue(true);
-      sub = nc.lastValueStream.listen(handle);
-
-      // model/serial once
-      if (b.model.isEmpty) {
-        rx.clear();
-        await wc.write(readCmd(0x01, 0x00AA, 35), withoutResponse: true);
-        await Future.delayed(const Duration(milliseconds: 700));
+      if (b.protocol != proto) {
+        b.protocol = proto;
+        _savePrefs();
       }
 
-      rx.clear();
-      await wc.write(readCmd(0x01, 0x0000, 59), withoutResponse: true);
+      await nc.setNotifyValue(true);
+      sub = nc.lastValueStream
+          .listen(proto == 'jbd' ? handleJbd : handlePace);
 
-      await done.future.timeout(const Duration(seconds: 4),
-          onTimeout: () => false);
+      if (proto == 'jbd') {
+        rx.clear();
+        await wc.write(jbdCmd(0x03), withoutResponse: true);
+        await Future.delayed(const Duration(milliseconds: 600));
+        await wc.write(jbdCmd(0x04), withoutResponse: true);
+        await done.future
+            .timeout(const Duration(seconds: 4), onTimeout: () => false);
+      } else {
+        // model/serial once
+        if (b.model.isEmpty) {
+          rx.clear();
+          await wc.write(readCmd(0x01, 0x00AA, 35), withoutResponse: true);
+          await Future.delayed(const Duration(milliseconds: 700));
+        }
+
+        rx.clear();
+        await wc.write(readCmd(0x01, 0x0000, 59), withoutResponse: true);
+
+        await done.future
+            .timeout(const Duration(seconds: 4), onTimeout: () => false);
+      }
     } catch (_) {
-      gotLive = false;
+      // keep whatever was decoded before the error
     } finally {
       await sub?.cancel();
       try {
@@ -380,7 +515,9 @@ class _HomePageState extends State<HomePage> {
 
   void _decodeLive(Battery b, List<int> d) {
     if (d.length < 118) return;
-    b.current = _s16(d, 0) / 100.0;
+    // PACE reports positive = discharging. Flip it so the whole app uses
+    // one convention: positive = charging, negative = discharging.
+    b.current = -_s16(d, 0) / 100.0;
     b.voltage = _u16(d, 1) / 100.0;
     b.soc = _u16(d, 2);
     b.soh = _u16(d, 3);
@@ -404,6 +541,57 @@ class _HomePageState extends State<HomePage> {
         txt.trim().split(RegExp(r'\s{2,}')).where((s) => s.isNotEmpty).toList();
     if (parts.isNotEmpty) b.model = parts[0].trim();
     if (parts.length > 1) b.serial = parts[1].trim();
+  }
+
+  // ---------- JBD decoders ----------
+  // Byte-indexed helpers (the PACE ones are register-indexed).
+  int _jb16(List<int> d, int i) => (d[i] << 8) | d[i + 1];
+  int _js16(List<int> d, int i) {
+    final v = _jb16(d, i);
+    return v > 32767 ? v - 65536 : v;
+  }
+
+  void _decodeJbdBasic(Battery b, List<int> d) {
+    if (d.length < 23) return;
+    b.voltage = _jb16(d, 0) / 100.0;
+    // JBD already uses negative = discharging, which matches our convention.
+    b.current = _js16(d, 2) / 100.0;
+    b.remainAh = _jb16(d, 4) / 100.0;
+    b.fullAh = _jb16(d, 6) / 100.0;
+    if (b.designAh == 0) b.designAh = b.fullAh;
+    b.cycles = _jb16(d, 8);
+    b.protect = _jb16(d, 16) != 0;
+    b.soc = d[19];
+    b.soh = 100;
+    b.chgMos = (d[20] & 0x01) != 0;
+    b.disMos = (d[20] & 0x02) != 0;
+    b.cellCount = d[21];
+
+    final ntc = d[22];
+    final temps = <double>[];
+    for (int i = 0; i < ntc; i++) {
+      final off = 23 + i * 2;
+      if (off + 1 >= d.length) break;
+      temps.add((_jb16(d, off) - 2731) / 10.0);
+    }
+    if (temps.isNotEmpty) {
+      b.temp1 = temps[0];
+      b.temp2 = temps.length > 1 ? temps[1] : temps[0];
+      b.tempMos = temps[0];
+    }
+    if (b.model.isEmpty) b.model = b.name;
+    b.updated = DateTime.now();
+  }
+
+  void _decodeJbdCells(Battery b, List<int> d) {
+    final cells = <double>[];
+    for (int i = 0; i + 1 < d.length; i += 2) {
+      cells.add(_jb16(d, i) / 1000.0);
+    }
+    if (cells.isEmpty) return;
+    b.cells = cells;
+    if (b.cellCount == 0) b.cellCount = cells.length;
+    b.updated = DateTime.now();
   }
 
   // ---------- Monitoring loop ----------
@@ -627,6 +815,20 @@ class _HomePageState extends State<HomePage> {
                         padding: const EdgeInsets.all(16),
                         child: Column(
                           children: [
+                            SwitchListTile(
+                              value: _showAll,
+                              contentPadding: EdgeInsets.zero,
+                              title: const Text('إظهار كل الأجهزة',
+                                  style: TextStyle(fontSize: 13)),
+                              subtitle: const Text(
+                                'فعّلها إذا لم تظهر بطاريتك في البحث',
+                                style: TextStyle(fontSize: 11),
+                              ),
+                              onChanged: (v) {
+                                setSheet(() => _showAll = v);
+                                setState(() {});
+                              },
+                            ),
                             SizedBox(
                               width: double.infinity,
                               child: OutlinedButton.icon(
@@ -1281,6 +1483,20 @@ class _HomePageState extends State<HomePage> {
           _tile('MOS', '${b.tempMos.toStringAsFixed(1)}°', Icons.memory,
               Colors.redAccent),
         ]),
+        if (b.protocol == 'jbd')
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _flag('مفتاح الشحن', b.chgMos),
+                  _flag('مفتاح التفريغ', b.disMos),
+                  _flag('لا إنذارات', !b.protect),
+                ],
+              ),
+            ),
+          ),
         if (b.model.isNotEmpty)
           Card(
             child: Padding(
@@ -1288,6 +1504,8 @@ class _HomePageState extends State<HomePage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Text('البروتوكول: ${b.protocolLabel}',
+                      style: const TextStyle(fontSize: 12)),
                   Text('الموديل: ${b.model}',
                       style: const TextStyle(fontSize: 12)),
                   if (b.serial.isNotEmpty)
@@ -1307,6 +1525,17 @@ class _HomePageState extends State<HomePage> {
             style: const TextStyle(color: Colors.grey, fontSize: 12),
           ),
         ),
+      ],
+    );
+  }
+
+  Widget _flag(String label, bool ok) {
+    return Column(
+      children: [
+        Icon(ok ? Icons.check_circle : Icons.cancel,
+            color: ok ? Colors.green : Colors.redAccent, size: 26),
+        const SizedBox(height: 4),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
       ],
     );
   }
