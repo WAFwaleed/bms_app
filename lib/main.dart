@@ -17,7 +17,9 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF00897B),
+          // Neutral slate base, so that green (charging) and orange
+          // (discharging) carry meaning instead of blending into the theme.
+          seedColor: const Color(0xFF4A5D6B),
           brightness: Brightness.dark,
         ),
       ),
@@ -99,6 +101,30 @@ String formatHours(double? h) {
   final mm = total % 60;
   if (hh == 0) return '$mm $_minLetter';
   return '$hh $_hourLetter $mm $_minLetter';
+}
+
+// ============ State colours ============
+// Green while charging, orange shades while discharging, red when low,
+// neutral when idle. Used by every progress bar and status accent.
+const Color kIdleColor = Color(0xFF78909C); // blue grey
+
+Color stateColor(double current, num soc) {
+  if (current > 0.05) return const Color(0xFF2E9E4F); // charging - green
+  if (current < -0.05) {
+    if (soc <= 20) return const Color(0xFFD32F2F); // critical - red
+    if (soc <= 50) return const Color(0xFFEF6C00); // deep orange
+    return const Color(0xFFFFA726); // orange
+  }
+  return kIdleColor;
+}
+
+Color stateAccent(double current, num soc) {
+  if (current > 0.05) return const Color(0xFF66E08A);
+  if (current < -0.05) {
+    if (soc <= 20) return const Color(0xFFFF8A80);
+    return const Color(0xFFFFB74D);
+  }
+  return const Color(0xFFB0BEC5);
 }
 
 // ============ Battery model ============
@@ -515,9 +541,10 @@ class _HomePageState extends State<HomePage> {
 
   void _decodeLive(Battery b, List<int> d) {
     if (d.length < 118) return;
-    // PACE reports positive = discharging. Flip it so the whole app uses
-    // one convention: positive = charging, negative = discharging.
-    b.current = -_s16(d, 0) / 100.0;
+    // Verified against live readings: PACE reports positive = charging,
+    // which already matches the app-wide convention
+    // (positive = charging, negative = discharging).
+    b.current = _s16(d, 0) / 100.0;
     b.voltage = _u16(d, 1) / 100.0;
     b.soc = _u16(d, 2);
     b.soh = _u16(d, 3);
@@ -1013,7 +1040,7 @@ class _HomePageState extends State<HomePage> {
       children: [
         // System summary
         Card(
-          color: Colors.teal.shade900.withValues(alpha: 0.4),
+          color: stateColor(_totalCurrent, _avgSoc).withValues(alpha: 0.22),
           child: Padding(
             padding: const EdgeInsets.all(16),
             child: Column(
@@ -1027,7 +1054,7 @@ class _HomePageState extends State<HomePage> {
                         style: TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.bold,
-                            color: Colors.teal.shade100)),
+                            color: stateAccent(_totalCurrent, _avgSoc))),
                   ],
                 ),
                 const SizedBox(height: 4),
@@ -1043,11 +1070,7 @@ class _HomePageState extends State<HomePage> {
                   child: LinearProgressIndicator(
                     value: _avgSoc / 100,
                     minHeight: 12,
-                    color: _avgSoc > 40
-                        ? Colors.green
-                        : _avgSoc > 20
-                            ? Colors.orange
-                            : Colors.red,
+                    color: stateColor(_totalCurrent, _avgSoc),
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -1067,7 +1090,7 @@ class _HomePageState extends State<HomePage> {
                             ? Icons.battery_charging_full
                             : Icons.timelapse,
                         size: 22,
-                        color: Colors.tealAccent,
+                        color: stateAccent(_totalCurrent, _avgSoc),
                       ),
                       const SizedBox(width: 10),
                       Column(
@@ -1185,12 +1208,8 @@ class _HomePageState extends State<HomePage> {
     final statusColor = never
         ? Colors.grey
         : b.stale
-            ? Colors.orange
-            : b.charging
-                ? Colors.green
-                : b.discharging
-                    ? Colors.amber
-                    : Colors.blueGrey;
+            ? Colors.amber.shade700
+            : stateColor(b.current, b.soc);
 
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 5),
@@ -1241,11 +1260,7 @@ class _HomePageState extends State<HomePage> {
                             child: LinearProgressIndicator(
                               value: b.soc / 100,
                               minHeight: 6,
-                              color: b.soc > 40
-                                  ? Colors.green
-                                  : b.soc > 20
-                                      ? Colors.orange
-                                      : Colors.red,
+                              color: stateColor(b.current, b.soc),
                             ),
                           ),
                         ],
@@ -1317,11 +1332,7 @@ class _HomePageState extends State<HomePage> {
         : b.discharging
             ? 'جاري التفريغ'
             : 'ساكن';
-    final statusColor = b.charging
-        ? Colors.green
-        : b.discharging
-            ? Colors.orange
-            : Colors.grey;
+    final statusColor = stateColor(b.current, b.soc);
 
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -1363,11 +1374,7 @@ class _HomePageState extends State<HomePage> {
                   child: LinearProgressIndicator(
                     value: b.soc / 100,
                     minHeight: 14,
-                    color: b.soc > 40
-                        ? Colors.green
-                        : b.soc > 20
-                            ? Colors.orange
-                            : Colors.red,
+                    color: stateColor(b.current, b.soc),
                   ),
                 ),
                 const SizedBox(height: 14),
@@ -1387,8 +1394,8 @@ class _HomePageState extends State<HomePage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      const Icon(Icons.timelapse,
-                          size: 20, color: Colors.tealAccent),
+                      Icon(Icons.timelapse,
+                          size: 20, color: stateAccent(b.current, b.soc)),
                       const SizedBox(width: 8),
                       Text(b.timeText,
                           style: const TextStyle(
@@ -1411,7 +1418,7 @@ class _HomePageState extends State<HomePage> {
               'التيار',
               '${b.current.abs().toStringAsFixed(2)} A',
               b.charging ? Icons.arrow_downward : Icons.arrow_upward,
-              b.charging ? Colors.green : Colors.orange),
+              stateColor(b.current, b.soc)),
         ]),
         Row(children: [
           _tile('القدرة', '${b.power.abs().toStringAsFixed(0)} W',
